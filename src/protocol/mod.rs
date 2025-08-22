@@ -187,6 +187,18 @@ impl<Stream> WebSocket<Stream> {
     }
 
     /// Convert a raw socket into a WebSocket without performing a handshake.
+    pub fn from_raw_socket_with_extensions(
+        stream: Stream,
+        role: Role,
+        config: Option<WebSocketConfig>,
+        extensions: Extensions,
+    ) -> Self {
+        let mut context = WebSocketContext::new(role, config);
+        context.extensions = extensions;
+        WebSocket { socket: stream, context }
+    }
+
+    /// Convert a raw socket into a WebSocket without performing a handshake.
     ///
     /// Call this function if you're using Tungstenite as a part of a web framework
     /// or together with an existing one. If you need an initial handshake, use
@@ -200,9 +212,21 @@ impl<Stream> WebSocket<Stream> {
         role: Role,
         config: Option<WebSocketConfig>,
     ) -> Self {
+        Self::from_partially_read_with_extensions(stream, part, role, config, Extensions::default())
+    }
+
+    pub(crate) fn from_partially_read_with_extensions(
+        stream: Stream,
+        part: Vec<u8>,
+        role: Role,
+        config: Option<WebSocketConfig>,
+        extensions: Extensions,
+    ) -> Self {
         WebSocket {
             socket: stream,
-            context: WebSocketContext::from_partially_read(part, role, config),
+            context: WebSocketContext::from_partially_read_with_extensions(
+                part, role, config, extensions,
+            ),
         }
     }
 
@@ -403,6 +427,26 @@ impl WebSocketContext {
     pub fn from_partially_read(part: Vec<u8>, role: Role, config: Option<WebSocketConfig>) -> Self {
         let conf = config.unwrap_or_default();
         let extensions = conf.extensions.into_unnegotiated_context(role);
+        Self::_new(
+            role,
+            FrameCodec::from_partially_read(part, conf.read_buffer_size),
+            conf,
+            extensions,
+        )
+    }
+
+    /// Create a WebSocket context for a post-handshake stream with the enabled extensions.
+    ///
+    /// Where [`WebSocketContext::from_partially_read`] infers the enabled
+    /// extensions from the [`WebSocketConfig`], this allows the caller to
+    /// explicitly sets the extensions in use for the connection.
+    pub(crate) fn from_partially_read_with_extensions(
+        part: Vec<u8>,
+        role: Role,
+        config: Option<WebSocketConfig>,
+        extensions: Extensions,
+    ) -> Self {
+        let conf = config.unwrap_or_default();
         Self::_new(
             role,
             FrameCodec::from_partially_read(part, conf.read_buffer_size),

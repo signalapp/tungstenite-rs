@@ -1,6 +1,5 @@
 //! WebSocket extensions.
 // Only `permessage-deflate` is supported at the moment.
-#![allow(dead_code)]
 
 use bytes::Bytes;
 use thiserror::Error;
