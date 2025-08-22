@@ -6,6 +6,7 @@ use std::{
     result::Result as StdResult,
 };
 
+use headers::{Header, HeaderMapExt};
 use http::{
     response::Builder, HeaderMap, Request as HttpRequest, Response as HttpResponse, StatusCode,
 };
@@ -20,6 +21,7 @@ use super::{
 };
 use crate::{
     error::{Error, ProtocolError, Result},
+    extensions::{headers::SecWebsocketExtensions, Extensions},
     protocol::{Role, WebSocket, WebSocketConfig},
 };
 
@@ -202,6 +204,8 @@ pub struct ServerHandshake<S, C> {
     config: Option<WebSocketConfig>,
     /// Error code/flag. If set, an error will be returned after sending response to the client.
     error_response: Option<ErrorResponse>,
+    // Negotiated extension context for server.
+    extensions: Extensions,
     /// Internal stream type.
     _marker: PhantomData<S>,
 }
@@ -219,6 +223,7 @@ impl<S: Read + Write, C: Callback> ServerHandshake<S, C> {
                 callback: Some(callback),
                 config,
                 error_response: None,
+                extensions: Extensions::default(),
                 _marker: PhantomData,
             },
         }
@@ -240,7 +245,30 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                     return Err(Error::Protocol(ProtocolError::JunkAfterRequest));
                 }
 
-                let response = create_response(&result)?;
+                let mut response = create_response(&result)?;
+                if let Some(extensions) =
+                    result.headers().typed_try_get::<SecWebsocketExtensions>().map_err(|_| {
+                        ProtocolError::InvalidHeader(SecWebsocketExtensions::name().clone().into())
+                    })?
+                {
+                    let extensions_config = self
+                        .config
+                        .ok_or_else(|| {
+                            ProtocolError::InvalidHeader(
+                                SecWebsocketExtensions::name().clone().into(),
+                            )
+                        })?
+                        .extensions;
+                    let (extensions, agreed) = extensions_config
+                        .accept_offers(&extensions)
+                        .map_err(ProtocolError::from)?;
+
+                    if let Some(agreed) = agreed {
+                        response.headers_mut().typed_insert(agreed)
+                    };
+                    self.extensions = extensions;
+                }
+
                 let callback_result = if let Some(callback) = self.callback.take() {
                     callback.on_request(&result, response)
                 } else {
@@ -283,7 +311,12 @@ impl<S: Read + Write, C: Callback> HandshakeRole for ServerHandshake<S, C> {
                     return Err(Error::Http(http::Response::from_parts(parts, body).into()));
                 } else {
                     debug!("Server handshake done.");
-                    let websocket = WebSocket::from_raw_socket(stream, Role::Server, self.config);
+                    let websocket = WebSocket::from_raw_socket_with_extensions(
+                        stream,
+                        Role::Server,
+                        self.config,
+                        std::mem::take(&mut self.extensions),
+                    );
                     ProcessingResult::Done(websocket)
                 }
             }

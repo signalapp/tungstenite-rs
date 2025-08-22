@@ -3,7 +3,7 @@
 use std::{io, result, str, string};
 
 use crate::{
-    extensions::compression::CompressionError,
+    extensions::{compression::CompressionError, ExtensionsError},
     protocol::{frame::coding::Data, Message},
 };
 #[cfg(feature = "handshake")]
@@ -197,6 +197,9 @@ pub enum ProtocolError {
     /// The `Sec-WebSocket-Protocol` header was invalid
     #[error("SubProtocol error: {0}")]
     SecWebSocketSubProtocolError(SubProtocolError),
+    /// The `Sec-WebSocket-Extensions` header is invalid.
+    #[error("Invalid \"Sec-WebSocket-Extensions\" header: {0}")]
+    InvalidExtensionsHeader(#[from] ExtensionsError),
     /// Garbage data encountered after client request.
     #[error("Junk after client request")]
     JunkAfterRequest,
