@@ -15,6 +15,7 @@ use self::{
 };
 use crate::{
     error::{CapacityError, Error, ProtocolError, Result},
+    extensions::ExtensionsConfig,
     protocol::frame::Utf8Bytes,
 };
 use log::*;
@@ -90,6 +91,11 @@ pub struct WebSocketConfig {
     /// some popular libraries that are sending unmasked frames, ignoring the RFC.
     /// By default this option is set to `false`, i.e. according to RFC 6455.
     pub accept_unmasked_frames: bool,
+    /// Configuration for optional extensions to the base websocket protocol.
+    ///
+    /// Some extensions may require optional features to be enabled at build
+    /// time to be supported.
+    pub extensions: ExtensionsConfig,
 }
 
 impl Default for WebSocketConfig {
@@ -101,6 +107,7 @@ impl Default for WebSocketConfig {
             max_message_size: Some(64 << 20),
             max_frame_size: Some(16 << 20),
             accept_unmasked_frames: false,
+            extensions: ExtensionsConfig::default(),
         }
     }
 }

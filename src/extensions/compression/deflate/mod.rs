@@ -1,7 +1,6 @@
 //! Implements "permessage-deflate" PMCE defined in [RFC 7692 Section 7]
 //!
 //! [RFC 7692 Section 7]: https://tools.ietf.org/html/rfc7692#section-7
-#![allow(dead_code)]
 use std::{io::Write, num::NonZeroU8};
 
 use bytes::Bytes;
@@ -14,8 +13,11 @@ use thiserror::Error;
 use crate::protocol::Role;
 
 mod config;
+#[cfg_attr(not(feature = "handshake"), allow(unused_imports))]
+pub(crate) use config::ParameterError as DeflateParameterError;
 pub use config::{
     DeflateConfig, NegotiationError as DeflateNegotiationError, PermessageDeflateConfig,
+    PER_MESSAGE_DEFLATE as EXTENSION_NAME,
 };
 
 #[derive(Debug)]
@@ -50,7 +52,7 @@ struct DeflateDecompress {
 }
 
 impl DeflateContext {
-    fn new(role: Role, config: DeflateConfig) -> Self {
+    pub(crate) fn new(role: Role, config: DeflateConfig) -> Self {
         let DeflateConfig {
             server_no_context_takeover,
             client_no_context_takeover,
@@ -231,6 +233,12 @@ impl DeflateDecompress {
         let output = output.unwrap_or_else(|| std::mem::take(self.decompressor.get_mut()));
 
         Ok(Bytes::from(output))
+    }
+}
+
+impl From<DeflateContext> for super::PerMessageCompressionContext {
+    fn from(value: DeflateContext) -> Self {
+        Self::Deflate(value)
     }
 }
 

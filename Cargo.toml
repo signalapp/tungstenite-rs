@@ -19,7 +19,7 @@ all-features = true
 
 [features]
 default = ["handshake"]
-handshake = ["data-encoding", "http", "httparse", "sha1"]
+handshake = ["data-encoding", "headers", "httparse", "sha1"]
 headers = ["http", "dep:headers"]
 url = ["dep:url"]
 native-tls = ["native-tls-crate"]

@@ -10,7 +10,7 @@ use crate::protocol::Role;
 /// Name of the extension as it appears in the Sec-WebSocket-Extensions header.
 ///
 /// Defined by [RFC 7692 Section 7](https://tools.ietf.org/html/rfc7692#section-7)
-const PER_MESSAGE_DEFLATE: &str = "permessage-deflate";
+pub const PER_MESSAGE_DEFLATE: &str = "permessage-deflate";
 
 /// Extension option that determines whether the server should use the LZ77
 /// sliding window from a sent frame for the subsequent frame.
@@ -74,7 +74,7 @@ pub enum NegotiationError {
 /// directive.
 #[derive(Debug, Error)]
 #[cfg_attr(test, derive(PartialEq))]
-pub enum ParameterError {
+pub(crate) enum ParameterError {
     /// Unknown parameter in a negotiation response.
     #[error("Unknown parameter in a negotiation response: {0}")]
     UnknownParameter(String),
@@ -599,7 +599,7 @@ impl PermessageDeflateConfig {
     }
 
     /// Parses the extension parameter list for a `Sec-WebSocket-Extensions` header.
-    fn parse_params<'p>(
+    pub(crate) fn parse_params<'p>(
         params: impl IntoIterator<Item = &'p WebsocketExtensionParam>,
     ) -> Result<Self, ParameterError> {
         let mut this = Self {
@@ -698,6 +698,18 @@ impl PermessageDeflateConfig {
 impl Default for DeflateConfig {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl From<&PermessageDeflateConfig> for WebsocketProtocolExtension {
+    fn from(value: &PermessageDeflateConfig) -> Self {
+        value.as_extension()
+    }
+}
+
+impl From<PermessageDeflateConfig> for WebsocketProtocolExtension {
+    fn from(value: PermessageDeflateConfig) -> Self {
+        value.as_extension()
     }
 }
 
