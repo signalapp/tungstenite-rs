@@ -114,11 +114,11 @@ required-features = ["handshake"]
 
 [[example]]
 name = "autobahn-client"
-required-features = ["handshake"]
+required-features = ["handshake", "deflate"]
 
 [[example]]
 name = "autobahn-server"
-required-features = ["handshake"]
+required-features = ["handshake", "deflate"]
 
 [[example]]
 name = "callback-error"
