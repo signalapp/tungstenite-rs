@@ -26,18 +26,14 @@ pub struct DeflateContext {
 }
 
 /// Errors from `permessage-deflate` extension.
-#[derive(Debug, Error)]
+#[derive(Copy, Clone, Debug, Error, PartialEq, Eq)]
 pub enum DeflateError {
     /// Compress failed
     #[error("Failed to compress")]
-    Compress(#[source] std::io::Error),
+    Compress,
     /// Decompress failed
     #[error("Failed to decompress")]
-    Decompress(#[source] std::io::Error),
-
-    /// Extension negotiation failed.
-    #[error("Extension negotiation failed")]
-    Negotiation(#[source] DeflateNegotiationError),
+    Decompress,
 }
 
 #[derive(Debug)]
@@ -115,7 +111,10 @@ impl DeflateContext {
 
     /// Compress the payload of an outgoing message.
     pub(crate) fn compress(&mut self, data: &[u8]) -> Result<Bytes, DeflateError> {
-        self.compress.compress(data).map_err(DeflateError::Compress)
+        self.compress.compress(data).map_err(|e| {
+            log::debug!("compression failed: {e}");
+            DeflateError::Compress
+        })
     }
 
     /// Decompress the payload in a received frame.
@@ -126,7 +125,10 @@ impl DeflateContext {
         data: &[u8],
         is_final: bool,
     ) -> Result<Bytes, DeflateError> {
-        self.decompress.decompress(data, is_final).map_err(DeflateError::Decompress)
+        self.decompress.decompress(data, is_final).map_err(|e| {
+            log::debug!("decompression failed: {e}");
+            DeflateError::Decompress
+        })
     }
 }
 
