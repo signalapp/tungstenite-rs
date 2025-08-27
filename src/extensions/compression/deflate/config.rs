@@ -1,5 +1,6 @@
 use std::{num::NonZeroU8, str::FromStr};
 
+use flate2::Compression;
 use log::*;
 use thiserror::Error;
 
@@ -135,6 +136,8 @@ pub struct PermessageDeflateConfig {
 /// [RFC 7692 Section 7]: https://tools.ietf.org/html/rfc7692#section-7
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeflateConfig {
+    /// How hard to try to compress outgoing data.
+    pub compression: Compression,
     /// If set, indicates that server compression of a subsequent message won't
     /// reuse the context window of the previous one.
     pub server_no_context_takeover: bool,
@@ -156,6 +159,7 @@ impl DeflateConfig {
     /// Constructs a new [`DeflateConfig`] with default parameters.
     pub fn new() -> Self {
         Self {
+            compression: Compression::default(),
             server_no_context_takeover: false,
             client_no_context_takeover: false,
             server_max_window_bits: *SUPPORTED_WINDOW_BITS.end(),
@@ -226,6 +230,7 @@ impl DeflateConfig {
             client_no_context_takeover,
             server_max_window_bits,
             client_max_window_bits,
+            compression: _,
         } = *self;
 
         // From RFC 7692 Section 7.1.2.1:
@@ -301,6 +306,7 @@ impl DeflateConfig {
             client_no_context_takeover,
             server_max_window_bits,
             client_max_window_bits,
+            compression,
         } = *self;
 
         // From RFC 7692 Section 7.1.1.1:
@@ -398,6 +404,7 @@ impl DeflateConfig {
         };
 
         let connection_config = DeflateConfig {
+            compression,
             server_no_context_takeover,
             client_no_context_takeover,
             server_max_window_bits,
@@ -432,6 +439,7 @@ impl DeflateConfig {
             client_no_context_takeover,
             server_max_window_bits,
             client_max_window_bits,
+            compression,
         } = self;
 
         let server_no_context_takeover =
@@ -547,6 +555,7 @@ impl DeflateConfig {
         debug_assert!(SUPPORTED_WINDOW_BITS.contains(&client_max_window_bits));
 
         Ok(Self {
+            compression,
             server_no_context_takeover,
             client_no_context_takeover,
             server_max_window_bits,
