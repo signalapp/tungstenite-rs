@@ -2,7 +2,10 @@
 
 use std::{io, result, str, string};
 
-use crate::protocol::{frame::coding::Data, Message};
+use crate::{
+    extensions::compression::CompressionError,
+    protocol::{frame::coding::Data, Message},
+};
 #[cfg(feature = "handshake")]
 use http::{header::HeaderName, Response};
 use thiserror::Error;
@@ -229,6 +232,9 @@ pub enum ProtocolError {
     /// Control frames must not be fragmented.
     #[error("Fragmented control frame")]
     FragmentedControlFrame,
+    /// Control frames must not be compressed.
+    #[error("Compressed control frame")]
+    CompressedControlFrame,
     /// Control frames must have a payload of 125 bytes or less.
     #[error("Control frame too big (payload must be 125 bytes or less)")]
     ControlFrameTooBig,
@@ -241,6 +247,9 @@ pub enum ProtocolError {
     /// Received a continue frame despite there being nothing to continue.
     #[error("Continue frame but nothing to continue")]
     UnexpectedContinueFrame,
+    /// Received a compressed continue frame.
+    #[error("Continue frame must not have compress bit set")]
+    CompressedContinueFrame,
     /// Received data while waiting for more fragments.
     #[error("While waiting for more fragments received: {0}")]
     ExpectedFragment(Data),
@@ -253,6 +262,9 @@ pub enum ProtocolError {
     /// The payload for the closing frame is invalid.
     #[error("Invalid close sequence")]
     InvalidCloseSequence,
+    /// Compression or decompression failure.
+    #[error("Compression/decompression failed: {0}")]
+    CompressionFailure(#[from] CompressionError),
 }
 
 /// Indicates the specific type/cause of URL error.

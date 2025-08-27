@@ -83,6 +83,8 @@ use bytes::Bytes;
 #[derive(Debug)]
 pub struct IncompleteMessage {
     collector: IncompleteMessageCollector,
+    #[cfg(feature = "deflate")]
+    compressed: bool,
 }
 
 #[derive(Debug)]
@@ -101,7 +103,30 @@ impl IncompleteMessage {
                     IncompleteMessageCollector::Text(StringCollector::new())
                 }
             },
+            #[cfg(feature = "deflate")]
+            compressed: false,
         }
+    }
+
+    /// Create new instance that will hold compressed data.
+    #[cfg(feature = "deflate")]
+    pub fn new_compressed(message_type: IncompleteMessageType) -> Self {
+        IncompleteMessage {
+            collector: match message_type {
+                IncompleteMessageType::Binary => IncompleteMessageCollector::Binary(Vec::new()),
+                IncompleteMessageType::Text => {
+                    IncompleteMessageCollector::Text(StringCollector::new())
+                }
+            },
+            compressed: true,
+        }
+    }
+
+    pub fn compressed(&self) -> bool {
+        #[cfg(feature = "deflate")]
+        return self.compressed;
+        #[cfg(not(feature = "deflate"))]
+        return false;
     }
 
     /// Get the current filled size of the buffer.
