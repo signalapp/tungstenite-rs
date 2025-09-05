@@ -1,13 +1,8 @@
 //! Implements "permessage-deflate" PMCE defined in [RFC 7692 Section 7]
 //!
 //! [RFC 7692 Section 7]: https://tools.ietf.org/html/rfc7692#section-7
-use std::{io::Write, num::NonZeroU8};
-
 use bytes::Bytes;
-use flate2::{
-    write::{ZlibDecoder, ZlibEncoder},
-    Compress, Decompress,
-};
+use flate2::{Compress, Decompress, FlushCompress, FlushDecompress, Status};
 use thiserror::Error;
 
 use crate::protocol::Role;
@@ -41,14 +36,25 @@ pub enum DeflateError {
 #[derive(Debug)]
 struct DeflateCompress {
     own_context_takeover: bool,
-    compressor: ZlibEncoder<Vec<u8>>,
+    /// The actual compressor to run payloads through.
+    ///
+    /// Use the low-level [`Compress`] API instead of the higher-level
+    /// [`flate2::zlib::write::ZlibEncoder`] so we can compress directly into
+    /// the output buffer instead of the intermediate one that that type holds.
+    compressor: Compress,
 }
 
 #[derive(Debug)]
 struct DeflateDecompress {
-    decompressor: ZlibDecoder<Vec<u8>>,
+    /// The actual decompressor to run payloads through.
+    ///
+    /// Use the low-level [`Decompress`] API instead of the higher-level
+    /// [`flate2::zlib::write::ZlibDecoder`] so we can decompress directly into
+    /// the output buffer instead of the intermediate one that that type holds.
+    /// This also lets us avoid some decompression errors that the higher-level
+    /// version exhibited with certain highly-compressed payloads.
+    decompressor: Decompress,
     peer_context_takeover: bool,
-    peer_window_bits: NonZeroU8,
 }
 
 impl DeflateContext {
@@ -91,22 +97,18 @@ impl DeflateContext {
         DeflateContext {
             compress: DeflateCompress {
                 own_context_takeover: !own_no_context_takeover,
-                compressor: ZlibEncoder::new_with_compress(
-                    Vec::new(),
-                    Compress::new_with_window_bits(
-                        compression,
-                        false,
-                        compressor_window_bits.get(),
-                    ),
+                compressor: Compress::new_with_window_bits(
+                    compression,
+                    false,
+                    compressor_window_bits.get(),
                 ),
             },
             decompress: DeflateDecompress {
                 peer_context_takeover: !peer_no_context_takeover,
-                decompressor: ZlibDecoder::new_with_decompress(
-                    Vec::new(),
-                    Decompress::new_with_window_bits(false, decompressor_window_bits.get()),
+                decompressor: Decompress::new_with_window_bits(
+                    false,
+                    decompressor_window_bits.get(),
                 ),
-                peer_window_bits: decompressor_window_bits,
             },
         }
     }
@@ -141,10 +143,22 @@ impl DeflateCompress {
     ///
     /// This is asymmetric with [`DeflateDecompress::decompress`] in that it
     /// operates on the contents of an entire message, not the comprising frames.
-    fn compress(&mut self, data: &[u8]) -> Result<Bytes, std::io::Error> {
-        // Make sure the backing buffer doesn't start out empty. This isn't
-        // necessary for correctness.
-        self.compressor.get_mut().reserve(data.len());
+    fn compress(&mut self, mut data: &[u8]) -> Result<Bytes, std::io::Error> {
+        log::trace!("compressing message payload with {} bytes", data.len());
+        if data.is_empty() {
+            // Fast path for an empty payload: it gets DEFLATE compressed to a
+            // zero-length uncompressed block, which conveniently is
+            // concat([0x00], ELIDED_TRAILER_BLOCK_CONTENTS). Then, per the RFC,
+            // we elide the trailing 4 bytes to get a single 0x00 byte as the
+            // compressed payload.
+            return Ok(Bytes::from_static(&[0x00]));
+        }
+
+        let mut output = Vec::new();
+
+        // The amount of space that should be available in `output` before
+        // attempting to compress data into it.
+        const REQUIRED_OUTPUT_SPACE: usize = 4096;
 
         // Per RFC 7692 Section 7.2.1:
         //
@@ -154,15 +168,84 @@ impl DeflateCompress {
         //         DEFLATE.
         //
 
-        self.compressor.write_all(data)?;
-        self.compressor.flush()?;
+        {
+            let mut total_read = self.compressor.total_in();
+            loop {
+                // Make sure there's space for compress_vec to write to.
+                output.reserve(REQUIRED_OUTPUT_SPACE);
+
+                let r = self.compressor.compress_vec(data, &mut output, FlushCompress::None)?;
+
+                let read_before = std::mem::replace(&mut total_read, self.compressor.total_in());
+                let read = (total_read - read_before) as usize;
+
+                data = &data[read..];
+                log::trace!(
+                    "compressed {read} bytes, {} remaining; partial output is {} bytes",
+                    data.len(),
+                    output.len()
+                );
+
+                match r {
+                    Status::Ok => continue,
+                    Status::BufError if read == 0 => {
+                        // We made no progress, so this BufError means that
+                        // we're out of input.
+                        break;
+                    }
+                    Status::BufError => {
+                        // We made some progress, so we can continue after
+                        // making more output space.
+                        continue;
+                    }
+                    Status::StreamEnd => break,
+                }
+            }
+        }
+
+        log::trace!("flushing compressed data");
 
         //     2.  If the resulting data does not end with an empty DEFLATE
         //         block with no compression (the "BTYPE" bits are set to 00),
         //         append an empty DEFLATE block with no compression to the tail
         //         end.
-        if !self.compressor.get_ref().ends_with(ELIDED_TRAILER_BLOCK_CONTENTS) {
-            self.compressor.flush()?;
+
+        // Ideally, at this point, we'd be able to just call compress_vec once
+        // with an empty slice, FlushCompress::Sync, and a vector with more than
+        // enough output space, and then we'd get an empty block and be done.
+        // After all, compress_vec is documented to output "as much output as
+        // possible".  Unfortunately, compress_vec does not actually do that for
+        // all backends. See:
+        // - https://github.com/rust-lang/flate2-rs/blob/1.1.2/src/ffi/rust.rs#L169
+        // - https://github.com/Frommi/miniz_oxide/blob/0.8.8/miniz_oxide/src/deflate/stream.rs#L82
+        // - https://github.com/Frommi/miniz_oxide/issues/105
+        //
+        // This causes compress_vec to return Ok as soon as the compressor
+        // writes *any* output when called with an empty slice.
+        //
+        // So, instead, we need to keep calling compress_vec with an empty slice
+        // until we stop making progress.
+        //
+        // Once we have done that properly, we should always have an empty block
+        // at the end of the output, and then we can truncate the output to
+        // remove the empty block, per the RFC.
+        {
+            let mut total_out = self.compressor.total_out();
+            loop {
+                output.reserve(REQUIRED_OUTPUT_SPACE);
+                let output_len_before = output.len();
+                let output_available_before = output.capacity() - output_len_before;
+
+                let _ = self.compressor.compress_vec(&[], &mut output, FlushCompress::Sync)?;
+                log::trace!(
+                    "flushed {} bytes into an available {output_available_before} bytes",
+                    output.len() - output_len_before,
+                );
+                let out_before = std::mem::replace(&mut total_out, self.compressor.total_out());
+                if total_out == out_before {
+                    break;
+                }
+            }
         }
 
         //     3.  Remove 4 octets (that are 0x00 0x00 0xff 0xff) from the tail
@@ -170,16 +253,16 @@ impl DeflateCompress {
         //         contains (possibly part of) the DEFLATE header bits with the
         //         "BTYPE" bits set to 00.
 
-        let mut output = std::mem::take(self.compressor.get_mut());
         debug_assert!(output.ends_with(ELIDED_TRAILER_BLOCK_CONTENTS), "output is {output:02x?}");
         output.truncate(output.len() - ELIDED_TRAILER_BLOCK_CONTENTS.len());
 
         if !self.own_context_takeover {
             // Reset if the next frame isn't supposed to be starting with the
             // same compression window.
-            self.compressor.reset(Vec::new())?;
+            self.compressor.reset();
         }
 
+        log::trace!("finished compression into {} bytes", output.len());
         Ok(Bytes::from(output))
     }
 }
@@ -199,38 +282,72 @@ impl DeflateDecompress {
         //
         //   2.  Decompress the resulting data using DEFLATE.
 
-        self.decompressor.get_mut().reserve(
-            // Optimistically assume a 50% compression ratio of the input.
-            2 * data.len(),
-        );
+        let mut output = Vec::new();
 
-        // Decompress the input received over the wire. That might not be all of
-        // the logical input to DEFLATE so don't try to sync.
-        self.decompressor.write_all(data)?;
+        let mut total_read = self.decompressor.total_in();
 
-        let mut output = None;
+        let mut decompress_from = |mut data: &[u8]| {
+            loop {
+                // Make sure there's some space to decompress into.
+                // Optimistically assume a 50% compression ratio of the input.
+                output.reserve(2 * data.len());
+
+                let r =
+                    self.decompressor.decompress_vec(data, &mut output, FlushDecompress::None)?;
+
+                let read_before = std::mem::replace(&mut total_read, self.decompressor.total_in());
+                let read = (total_read - read_before) as usize;
+
+                data = &data[read..];
+
+                match r {
+                    Status::Ok => continue,
+                    Status::BufError => {
+                        // We've either run out of input data or output space.
+                        // Since we reserve space ahead of time, this must mean
+                        // we're out of input.
+                        break;
+                    }
+                    Status::StreamEnd => {
+                        // Finished a block with BFINAL set. This is legal; from
+                        // RFC 7692 Section 7.2.3.4:
+                        //
+                        //   On platforms on which the flush method using an
+                        //   empty DEFLATE block with no compression is not
+                        //   available, implementors can choose to flush data
+                        //   using DEFLATE blocks with "BFINAL" set to 1.
+                        //
+                        // On the decompression end we reset the compressor in
+                        // response. This relies on the assumption that the
+                        // client produced the block with BFINAL set by
+                        // informing their compressor that the stream was
+                        // ending, and so any blocks afterwards won't reference
+                        // any context from this block or earlier. It's
+                        // obviously not a perfect assumption, but it matches
+                        // the behavior of other widely-deployed
+                        // permessage-deflate implementations.
+                        self.decompressor.reset(false);
+                        total_read = 0;
+                    }
+                }
+            }
+            std::io::Result::Ok(())
+        };
+
+        decompress_from(data)?;
+
         if is_final {
             // Decompress the final block that is part of the logical input to
-            // DEFLATE but is elided from the message payloads.
-            self.decompressor.write_all(ELIDED_TRAILER_BLOCK_CONTENTS)?;
-            self.decompressor.flush()?;
+            // DEFLATE but is elided from the message payloads. This implicitly
+            // flushes out any pending bytes that were part of the previous
+            // block and doesn't leave any others since the trailer is explicitly
+            // an empty block.
+            decompress_from(&ELIDED_TRAILER_BLOCK_CONTENTS)?;
 
             if !self.peer_context_takeover {
-                // This wholesale replacement shouldn't be needed but
-                // `ZlibDecoder::finish` assumes that the new input will have a
-                // zlib header, which isn't the case here, and doesn't have a
-                // way to override it.
-                let decompressor = std::mem::replace(
-                    &mut self.decompressor,
-                    ZlibDecoder::new_with_decompress(
-                        Vec::new(),
-                        Decompress::new_with_window_bits(false, self.peer_window_bits.get()),
-                    ),
-                );
-                output = Some(decompressor.finish()?);
+                self.decompressor.reset(false);
             }
         }
-        let output = output.unwrap_or_else(|| std::mem::take(self.decompressor.get_mut()));
 
         Ok(Bytes::from(output))
     }
@@ -244,7 +361,7 @@ impl From<DeflateContext> for super::PerMessageCompressionContext {
 
 #[cfg(test)]
 mod test {
-    use rand::{RngCore, SeedableRng as _};
+    use rand::{distr::Distribution as _, RngCore, SeedableRng as _};
 
     use super::*;
 
@@ -305,6 +422,100 @@ mod test {
         let compressed = context.compress(&data).unwrap();
 
         assert_eq!(&context.decompress(&compressed, true).unwrap(), &data);
+    }
+
+    #[test]
+    fn compressible_payload_prefixes() {
+        let _ = env_logger::try_init();
+        let data: Vec<u8> = rand::distr::Alphanumeric
+            .sample_iter(&mut rand::rngs::SmallRng::from_seed([59; 32]))
+            .take(1 << 16)
+            .collect();
+
+        let prefixes =
+            (5..).map(|i| 1 << i).take_while(|len| *len <= data.len()).map(|len| &data[..len]);
+
+        for prefix in prefixes {
+            let mut context = DeflateContext::new(Role::Client, DeflateConfig::default());
+            println!("compressing {} bytes of compressible data", prefix.len());
+
+            let compressed = context.compress(prefix).unwrap();
+            assert_eq!(context.decompress(&compressed, true).unwrap(), prefix);
+        }
+    }
+
+    #[test]
+    fn large_message_decompression() {
+        let _ = env_logger::try_init();
+        // Compressed payload that decompresses to 50KB of zeroes. This was
+        // specifically chosen so that its compressed form aligns with a byte
+        // boundary, which lets us repeat it an arbitrary number of times to
+        // form the payload of a single message.
+        const VERY_COMPRESSED: &[u8; 66] = &[
+            0xec, 0xc1, 0x31, 0x01, 0x00, 0x00, 0x00, 0xc2, 0xa0, 0xf5, 0x4f, 0x6d, 0x0b, 0x2f,
+            0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x6f,
+        ];
+        const DECOMPRESSED_LEN: usize = 50 * 1024;
+
+        fn make_frames(frame_count: usize) -> impl Iterator<Item = (Bytes, bool)> {
+            std::iter::repeat_n(VERY_COMPRESSED, frame_count).enumerate().map(move |(i, bytes)| {
+                let is_final = i == frame_count - 1;
+                (bytes.iter().copied().chain(is_final.then_some(0x00)).collect(), is_final)
+            })
+        }
+
+        for frame_count in 1..=10 {
+            let mut context = DeflateContext::new(Role::Client, DeflateConfig::default());
+
+            let decompressed: Bytes = make_frames(frame_count)
+                .enumerate()
+                .flat_map(|(i, (frame, is_final))| {
+                    context
+                        .decompress
+                        .decompress(&frame, is_final)
+                        .unwrap_or_else(|e| panic!("deflating frame {i}/{frame_count} failed: {e}"))
+                })
+                .collect();
+            assert!(decompressed.iter().all(|b| *b == 0));
+            assert_eq!(decompressed.len(), frame_count * DECOMPRESSED_LEN);
+        }
+    }
+
+    #[test]
+    fn decompress_multiple_messages_that_each_set_bfinal() {
+        let _ = env_logger::try_init();
+
+        let mut rng = rand::rngs::SmallRng::from_seed([12; 32]);
+        let uncompressed_payloads = std::iter::repeat_with(|| {
+            let mut data: Vec<u8> = vec![0; 1 << 12];
+            rng.fill_bytes(&mut data);
+            data
+        });
+
+        let mut context = DeflateContext::new(Role::Server, DeflateConfig::default());
+
+        for (i, payload) in uncompressed_payloads.enumerate().take(5) {
+            let mut compressed = context.compress(&payload).unwrap().try_into_mut().unwrap();
+            // The final block in the stream is a 5-byte uncompressed block, but
+            // with the trailing 4 bytes of the body chopped off (per the RFC).
+            // We don't know where in the last *byte* the final block begins
+            // (since DEFLATE is a bit-oriented protocol), so to make sure the
+            // payload ends with a block with BFINAL set we need to append
+            // another block. First we reattach the chopped-off bytes from the
+            // last block. Then we push *another* 5-byte uncompressed block with
+            // BFINAL set. Lastly we chop off the trailing 4 bytes per the spec.
+            compressed.extend_from_slice(ELIDED_TRAILER_BLOCK_CONTENTS);
+            compressed.extend_from_slice(&[0x01, 0x00, 0x00, 0xff, 0xff]);
+            compressed.truncate(compressed.len() - ELIDED_TRAILER_BLOCK_CONTENTS.len());
+
+            println!("decompressing block {i}");
+            let decompressed = context.decompress(&compressed, true).unwrap();
+            assert_eq!(decompressed.len(), payload.len());
+            assert_eq!(decompressed, payload);
+        }
     }
 
     mod rfc_7692_section_7_2_3_examples {
@@ -407,6 +618,30 @@ mod test {
             let mut context = DeflateContext::new(ROLE, DeflateConfig::default());
             assert_eq!(&context.compress(b"Hello").unwrap()[..], FIRST_PAYLOAD);
             assert_eq!(&context.compress(b"Hello").unwrap()[..], NEW_SECOND_PAYLOAD);
+        }
+
+        #[test]
+        fn deflate_block_with_bfinal_set() {
+            // From RFC 7692 Section 7.2.3.4:
+            //
+            //   On platforms on which the flush method using an empty DEFLATE
+            //   block with no compression is not available, implementors can
+            //   choose to flush data using DEFLATE blocks with "BFINAL" set to
+            //   1.
+
+            const PAYLOAD: &[u8] = &[0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x00];
+
+            //   This is the payload of a message containing "Hello" compressed
+            //   using a DEFLATE block with "BFINAL" set to 1.  The first 7
+            //   octets constitute a DEFLATE block with "BFINAL" set to 1 and
+            //   "BTYPE" set to 01 containing "Hello".  The last 1 octet (0x00)
+            //   contains the header bits with "BFINAL" set to 0 and "BTYPE" set
+            //   to 00, and 5 padding bits of 0.  This octet is necessary to
+            //   allow the payload to be decompressed in the same manner as
+            //   messages flushed using DEFLATE blocks with "BFINAL" unset.
+
+            let mut context = DeflateContext::new(Role::Client, DeflateConfig::default());
+            assert_eq!(context.decompress(PAYLOAD, true), Ok(Bytes::from_static(b"Hello")));
         }
 
         #[test]
