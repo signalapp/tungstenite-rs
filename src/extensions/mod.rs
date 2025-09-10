@@ -4,7 +4,9 @@
 use bytes::Bytes;
 use thiserror::Error;
 
-use crate::extensions::compression::{CompressionError, PerMessageCompressionContext};
+use crate::extensions::compression::{
+    CompressionError, DecompressionError, PerMessageCompressionContext,
+};
 #[cfg(feature = "handshake")]
 use crate::extensions::headers::{SecWebsocketExtensions, WebsocketProtocolExtension};
 use crate::protocol::Role;
@@ -266,14 +268,15 @@ impl Extensions {
     /// The returned value will only be `Some` if a per-message compression
     /// extension, as specified by [RFC 7692], was configured for the connection
     /// state to which this `Extensions` applies. The closure takes as arguments
-    /// the frame payload, in bytes, and `true` if the frame is the final one
-    /// for a message, otherwise false.
+    /// the frame payload, in bytes, a boolean indicating whether the frame is
+    /// the final one for a message, and the maximum number of uncompressed
+    /// bytes to produce before returning an error.
     ///
     /// [RFC 7692]: https://tools.ietf.org/html/rfc7692
     #[inline]
     pub(crate) fn per_message_decompressor<'s>(
         &'s mut self,
-    ) -> Option<impl FnMut(&Bytes, bool) -> Result<Bytes, CompressionError> + 's> {
+    ) -> Option<impl FnMut(&Bytes, bool, usize) -> Result<Bytes, DecompressionError> + 's> {
         let Self { per_message_compression } = self;
         per_message_compression.as_mut().map(PerMessageCompressionContext::decompressor)
     }
