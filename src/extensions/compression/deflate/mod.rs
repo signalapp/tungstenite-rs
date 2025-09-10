@@ -5,7 +5,7 @@ use bytes::Bytes;
 use flate2::{Compress, Decompress, FlushCompress, FlushDecompress, Status};
 use thiserror::Error;
 
-use crate::protocol::Role;
+use crate::{extensions::compression::DecompressionError, protocol::Role};
 
 mod config;
 #[cfg_attr(not(feature = "handshake"), allow(unused_imports))]
@@ -128,10 +128,13 @@ impl DeflateContext {
         &mut self,
         data: &[u8],
         is_final: bool,
-    ) -> Result<Bytes, DeflateError> {
-        self.decompress.decompress(data, is_final).map_err(|e| {
-            log::debug!("decompression failed: {e}");
-            DeflateError::Decompress
+        size_limit: usize,
+    ) -> Result<Bytes, DecompressionError<DeflateError>> {
+        self.decompress.decompress(data, is_final, size_limit).map_err(|e| {
+            e.map(|e: std::io::Error| {
+                log::debug!("decompression failed: {e}");
+                DeflateError::Decompress
+            })
         })
     }
 }
@@ -271,8 +274,16 @@ impl DeflateDecompress {
     /// Decompress the contents of a single frame.
     ///
     /// The `is_final` argument must be `true` if and only if the frame is the
-    /// last one in a message.
-    fn decompress(&mut self, data: &[u8], is_final: bool) -> Result<Bytes, std::io::Error> {
+    /// last one in a message. The `size_limit` argument is the maximum number
+    /// of bytes that can be decompressed. If the input `data` decompresses to
+    /// more than `size_limit` bytes, [`DecompressionError::SizeLimitReached`]
+    /// will be returned.
+    fn decompress(
+        &mut self,
+        data: &[u8],
+        is_final: bool,
+        size_limit: usize,
+    ) -> Result<Bytes, DecompressionError<std::io::Error>> {
         // From RFC 7692 Section 7.2.2:
         //
         //   An endpoint uses the following algorithm to decompress a message.
@@ -284,18 +295,29 @@ impl DeflateDecompress {
 
         let mut output = Vec::new();
 
+        log::trace!(
+            "decompressing {} bytes in {} frame",
+            data.len(),
+            if is_final { "final" } else { "intermediate" }
+        );
         let mut total_read = self.decompressor.total_in();
 
         let mut decompress_from = |mut data: &[u8]| {
             loop {
-                // Make sure there's some space to decompress into.
-                // Optimistically assume a 50% compression ratio of the input.
+                // Make sure there's some space to decompress into,
+                // optimistically assuming a 50% compression ratio of the input.
+                // This might put us slightly beyond the requested size limit
+                // but it also might not all be used.
                 output.reserve(2 * data.len());
 
                 let r =
                     self.decompressor.decompress_vec(data, &mut output, FlushDecompress::None)?;
 
+                if output.len() > size_limit {
+                    return Err(DecompressionError::SizeLimitReached);
+                }
                 let read_before = std::mem::replace(&mut total_read, self.decompressor.total_in());
+
                 let read = (total_read - read_before) as usize;
 
                 data = &data[read..];
@@ -331,7 +353,7 @@ impl DeflateDecompress {
                     }
                 }
             }
-            std::io::Result::Ok(())
+            Ok(())
         };
 
         decompress_from(data)?;
@@ -360,7 +382,7 @@ impl From<DeflateContext> for super::PerMessageCompressionContext {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use rand::{distr::Distribution as _, RngCore, SeedableRng as _};
 
     use super::*;
@@ -395,7 +417,7 @@ mod test {
                     let mut it = compressed.chunks(frame_size).peekable();
                     while let Some(frame) = it.next() {
                         decompressed.extend_from_slice(
-                            &server.decompress(frame, it.peek().is_none()).unwrap(),
+                            &server.decompress(frame, it.peek().is_none(), usize::MAX).unwrap(),
                         );
                     }
                     decompressed
@@ -421,7 +443,23 @@ mod test {
 
         let compressed = context.compress(&data).unwrap();
 
-        assert_eq!(&context.decompress(&compressed, true).unwrap(), &data);
+        assert_eq!(&context.decompress(&compressed, true, usize::MAX).unwrap(), &data);
+    }
+
+    #[test]
+    fn decompression_limits_applied() {
+        let data = vec![0; 1 << 18];
+
+        let mut context = DeflateContext::new(Role::Client, DeflateConfig::default());
+        let compressed = context.compress(&data).unwrap();
+
+        // A buffer of all zeros compresses very well.
+        assert!(compressed.len() < data.len() / 500);
+
+        assert_eq!(
+            context.decompress(&compressed, true, data.len() - 1),
+            Err(DecompressionError::SizeLimitReached)
+        );
     }
 
     #[test]
@@ -440,47 +478,58 @@ mod test {
             println!("compressing {} bytes of compressible data", prefix.len());
 
             let compressed = context.compress(prefix).unwrap();
-            assert_eq!(context.decompress(&compressed, true).unwrap(), prefix);
+            assert_eq!(context.decompress(&compressed, true, usize::MAX).unwrap(), prefix);
         }
     }
 
-    #[test]
-    fn large_message_decompression() {
-        let _ = env_logger::try_init();
+    /// Utilities for testing decomrpession of highly-compressed payloads.
+    pub(crate) mod very_compressed {
+        use bytes::Bytes;
+
         // Compressed payload that decompresses to 50KB of zeroes. This was
         // specifically chosen so that its compressed form aligns with a byte
         // boundary, which lets us repeat it an arbitrary number of times to
         // form the payload of a single message.
-        const VERY_COMPRESSED: &[u8; 66] = &[
+        pub(crate) const FRAME_PAYLOAD: &[u8; 66] = &[
             0xec, 0xc1, 0x31, 0x01, 0x00, 0x00, 0x00, 0xc2, 0xa0, 0xf5, 0x4f, 0x6d, 0x0b, 0x2f,
             0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x6f,
         ];
-        const DECOMPRESSED_LEN: usize = 50 * 1024;
+        pub(crate) const DECOMPRESSED_LEN: usize = 50 * 1024;
 
-        fn make_frames(frame_count: usize) -> impl Iterator<Item = (Bytes, bool)> {
-            std::iter::repeat_n(VERY_COMPRESSED, frame_count).enumerate().map(move |(i, bytes)| {
+        pub(crate) fn make_frames(frame_count: usize) -> impl Iterator<Item = (Bytes, bool)> {
+            std::iter::repeat_n(FRAME_PAYLOAD, frame_count).enumerate().map(move |(i, bytes)| {
                 let is_final = i == frame_count - 1;
-                (bytes.iter().copied().chain(is_final.then_some(0x00)).collect(), is_final)
+                let bytes = if is_final {
+                    bytes.iter().copied().chain(std::iter::once(0x00)).collect()
+                } else {
+                    Bytes::from_static(bytes)
+                };
+                (bytes, is_final)
             })
         }
+    }
+
+    #[test]
+    fn large_message_decompression() {
+        let _ = env_logger::try_init();
 
         for frame_count in 1..=10 {
             let mut context = DeflateContext::new(Role::Client, DeflateConfig::default());
 
-            let decompressed: Bytes = make_frames(frame_count)
+            let decompressed: Bytes = very_compressed::make_frames(frame_count)
                 .enumerate()
                 .flat_map(|(i, (frame, is_final))| {
                     context
                         .decompress
-                        .decompress(&frame, is_final)
+                        .decompress(&frame, is_final, usize::MAX)
                         .unwrap_or_else(|e| panic!("deflating frame {i}/{frame_count} failed: {e}"))
                 })
                 .collect();
             assert!(decompressed.iter().all(|b| *b == 0));
-            assert_eq!(decompressed.len(), frame_count * DECOMPRESSED_LEN);
+            assert_eq!(decompressed.len(), frame_count * very_compressed::DECOMPRESSED_LEN);
         }
     }
 
@@ -512,7 +561,7 @@ mod test {
             compressed.truncate(compressed.len() - ELIDED_TRAILER_BLOCK_CONTENTS.len());
 
             println!("decompressing block {i}");
-            let decompressed = context.decompress(&compressed, true).unwrap();
+            let decompressed = context.decompress(&compressed, true, usize::MAX).unwrap();
             assert_eq!(decompressed.len(), payload.len());
             assert_eq!(decompressed, payload);
         }
@@ -569,7 +618,7 @@ mod test {
                 .iter()
                 .enumerate()
                 .map(|(index, payload)| {
-                    context.decompress(payload, index == frame_payloads.len() - 1)
+                    context.decompress(payload, index == frame_payloads.len() - 1, usize::MAX)
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap()
@@ -641,7 +690,10 @@ mod test {
             //   messages flushed using DEFLATE blocks with "BFINAL" unset.
 
             let mut context = DeflateContext::new(Role::Client, DeflateConfig::default());
-            assert_eq!(context.decompress(PAYLOAD, true), Ok(Bytes::from_static(b"Hello")));
+            assert_eq!(
+                context.decompress(PAYLOAD, true, usize::MAX),
+                Ok(Bytes::from_static(b"Hello"))
+            );
         }
 
         #[test]
@@ -655,7 +707,7 @@ mod test {
 
             let mut context = DeflateContext::new(Role::Client, DeflateConfig::new());
 
-            assert_eq!(&context.decompress(TWO_BLOCKS, true).unwrap()[..], b"Hello");
+            assert_eq!(&context.decompress(TWO_BLOCKS, true, usize::MAX).unwrap()[..], b"Hello");
         }
     }
 }

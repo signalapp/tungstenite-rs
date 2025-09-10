@@ -26,6 +26,17 @@ pub enum CompressionError {
     Deflate(deflate::DeflateError),
 }
 
+#[derive(Debug, Error)]
+#[cfg_attr(test, derive(PartialEq))]
+pub(crate) enum DecompressionError<E = CompressionError> {
+    /// The decompressed frame is larger than the configured limit.
+    #[error("decompressed data is too large")]
+    SizeLimitReached,
+    /// An error was encountered while decompressing.
+    #[error("{0}")]
+    Decompression(E),
+}
+
 impl PerMessageCompressionContext {
     #[inline]
     pub(crate) fn compressor<'s>(
@@ -47,17 +58,32 @@ impl PerMessageCompressionContext {
     #[inline]
     pub(crate) fn decompressor<'s>(
         &'s mut self,
-    ) -> impl FnMut(&Bytes, bool) -> Result<Bytes, CompressionError> + 's {
-        move |payload, is_final| match self {
+    ) -> impl FnMut(&Bytes, bool, usize) -> Result<Bytes, DecompressionError> + 's {
+        move |payload, is_final, size_limit| match self {
             #[cfg(feature = "deflate")]
-            Self::Deflate(deflate_config) => {
-                deflate_config.decompress(payload, is_final).map_err(CompressionError::Deflate)
-            }
+            Self::Deflate(deflate_config) => deflate_config
+                .decompress(payload, is_final, size_limit)
+                .map_err(|e| e.map(CompressionError::Deflate)),
             #[cfg(not(feature = "deflate"))]
             _ => {
-                let _ = (payload, is_final);
+                let _ = (payload, is_final, size_limit);
                 unreachable!("*PerMessageCompressionContext is uninhabited")
             }
         }
+    }
+}
+
+impl<E> DecompressionError<E> {
+    pub(crate) fn map<T>(self, f: impl FnOnce(E) -> T) -> DecompressionError<T> {
+        match self {
+            Self::SizeLimitReached => DecompressionError::SizeLimitReached,
+            Self::Decompression(e) => DecompressionError::Decompression(f(e)),
+        }
+    }
+}
+
+impl<E: Into<std::io::Error>> From<E> for DecompressionError<std::io::Error> {
+    fn from(value: E) -> Self {
+        Self::Decompression(value.into())
     }
 }
