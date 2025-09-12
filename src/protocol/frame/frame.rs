@@ -300,6 +300,32 @@ impl Frame {
         }
     }
 
+    /// Create a new compressed data frame.
+    ///
+    /// `opcode` is of type `Data` because, per [RFC 7692 Section 6], "PMCEs
+    /// operate only on data messages".
+    ///
+    /// [RFC 7692 Section 6]: https://tools.ietf.org/html/rfc7692#section-6
+    #[inline]
+    pub(crate) fn compressed_message(data: Bytes, opcode: Data, is_final: bool) -> Frame {
+        Frame {
+            header: FrameHeader {
+                is_final,
+                opcode: OpCode::Data(opcode),
+                // Per RFC 7692 Section 6:
+                //
+                //   This document allocates the RSV1 bit of the WebSocket
+                //   header for PMCEs and calls the bit the "Per-Message
+                //   Compressed" bit.  On a WebSocket connection where a PMCE is
+                //   in use, this bit indicates whether a message is compressed
+                //   or not.
+                rsv1: true,
+                ..FrameHeader::default()
+            },
+            payload: data,
+        }
+    }
+
     /// Create a new Pong control frame.
     #[inline]
     pub fn pong(data: impl Into<Bytes>) -> Frame {
