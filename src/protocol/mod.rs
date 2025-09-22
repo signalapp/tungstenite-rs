@@ -11,7 +11,7 @@ use self::{
         coding::{CloseCode, Control as OpCtl, Data as OpData, OpCode},
         Frame, FrameCodec,
     },
-    message::{IncompleteMessage, IncompleteMessageType},
+    message::{IncompleteMessage, MessageType},
 };
 use crate::{
     error::{CapacityError, Error, ProtocolError, Result},
@@ -829,7 +829,7 @@ impl WebSocketContext {
                                 // received with compression disabled, but the
                                 // initial frame of the message was received
                                 // with compression *enabled* and RSV1 set.
-                                // 
+                                //
                                 // The only way to get here is to manually
                                 // disable compression for a stream after it's
                                 // been established, which is arguably operator
@@ -858,20 +858,19 @@ impl WebSocketContext {
                         Ok(None)
                     }
                     (_, Some(_)) => Err(ProtocolError::ExpectedFragment(data)),
-                    (OpData::Text, _) => Ok(Some((payload, IncompleteMessageType::Text))),
-                    (OpData::Binary, _) => Ok(Some((payload, IncompleteMessageType::Binary))),
+                    (OpData::Text, _) => Ok(Some((payload, MessageType::Text))),
+                    (OpData::Binary, _) => Ok(Some((payload, MessageType::Binary))),
                     (OpData::Reserved(i), _) => Err(ProtocolError::UnknownDataFrameType(i)),
                 }?;
+
                 match (payload, fin) {
                     (None, true) => Ok(Some(self.incomplete.take().unwrap().complete()?)),
                     (None, false) => Ok(None),
                     (Some((payload, t)), true) => {
                         check_max_size(payload.len(), self.config.max_message_size)?;
                         match t {
-                            IncompleteMessageType::Text => {
-                                Ok(Some(Message::Text(payload.try_into()?)))
-                            }
-                            IncompleteMessageType::Binary => Ok(Some(Message::Binary(payload))),
+                            MessageType::Text => Ok(Some(Message::Text(payload.try_into()?))),
+                            MessageType::Binary => Ok(Some(Message::Binary(payload))),
                         }
                     }
                     (Some((payload, t)), false) => {
