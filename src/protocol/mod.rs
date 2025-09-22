@@ -805,99 +805,84 @@ impl WebSocketContext {
 
             OpCode::Data(data) => {
                 let fin = frame.header().is_final;
+                let payload = frame.into_payload();
 
-                match data {
+                let decompressor = match data {
                     OpData::Continue => {
-                        let incomplete = self
-                            .incomplete
-                            .as_mut()
-                            .ok_or(Error::Protocol(ProtocolError::UnexpectedContinueFrame))?;
-
                         // Per RFC 7692:
                         //
                         //   An endpoint MUST NOT set the "Per-Message
                         //   Compressed" bit of control frames and non-first
-                        //   fragments of a data message.  An endpoint
-                        //   receiving such a frame MUST _Fail the WebSocket
-                        //   Connection_.
+                        //   fragments of a data message.  An endpoint receiving
+                        //   such a frame MUST _Fail the WebSocket Connection_.
                         if is_compressed {
                             return Err(Error::Protocol(ProtocolError::CompressedContinueFrame));
                         }
 
-                        let mut payload = frame.into_payload();
-                        if incomplete.compressed() {
-                            let mut decompressor = decompressor.ok_or_else(|| {
+                        let incomplete_compressed =
+                            self.incomplete.as_ref().map_or(false, IncompleteMessage::compressed);
+                        match (incomplete_compressed, &decompressor) {
+                            (false, _) => None,
+                            (true, Some(_)) => decompressor,
+                            (true, None) => {
                                 // This is a continuation frame that was
-                                // received with compression disabled, but
-                                // the initial frame of the message was
-                                // received with compression *enabled* and
-                                // RSV1 set.
-                                //
+                                // received with compression disabled, but the
+                                // initial frame of the message was received
+                                // with compression *enabled* and RSV1 set.
+                                // 
                                 // The only way to get here is to manually
-                                // disable compression for a stream after
-                                // it's been established, which is arguably
-                                // operator error. This is incorrect enough
-                                // that it's not worth spending a lot of
-                                // code on, but it's better to return an
-                                // error here than crash.
+                                // disable compression for a stream after it's
+                                // been established, which is arguably operator
+                                // error.  This is incorrect enough that it's
+                                // not worth spending a lot of code on, but it's
+                                // better to return an error here than crash.
                                 log::debug!("compression was disabled between receiving frames");
-                                ProtocolError::CompressedContinueFrame
-                            })?;
-
-                            payload = decompressor(&payload, fin)?;
-                        };
-
-                        incomplete.extend(payload, self.config.max_message_size)?;
-
-                        if fin {
-                            Ok(Some(self.incomplete.take().unwrap().complete()?))
-                        } else {
-                            Ok(None)
+                                return Err(Error::Protocol(
+                                    ProtocolError::CompressedContinueFrame,
+                                ));
+                            }
                         }
                     }
+                    OpData::Text | OpData::Binary => decompressor.filter(|_| is_compressed),
+                    OpData::Reserved(_) => None,
+                };
+                let payload = decompressor
+                    .map(|mut decompressor| decompressor(&payload, fin))
+                    .transpose()?
+                    .unwrap_or(payload);
 
-                    c if self.incomplete.is_some() => {
-                        Err(Error::Protocol(ProtocolError::ExpectedFragment(c)))
-                    }
-                    OpData::Text | OpData::Binary if fin => {
-                        let payload = frame.into_payload();
-                        let payload = match decompressor.filter(|_| is_compressed) {
-                            Some(mut frame_decompressor) => frame_decompressor(&payload, fin)?,
-                            None => payload,
-                        };
-
-                        check_max_size(payload.len(), self.config.max_message_size)?;
-
-                        match data {
-                            OpData::Text => Ok(Some(Message::Text(payload.try_into()?))),
-                            OpData::Binary => Ok(Some(Message::Binary(payload))),
-                            _ => panic!("Bug: message is not text nor binary"),
-                        }
-                    }
-                    OpData::Text | OpData::Binary => {
-                        let message_type = match data {
-                            OpData::Text => IncompleteMessageType::Text,
-                            OpData::Binary => IncompleteMessageType::Binary,
-                            _ => panic!("Bug: message is not text nor binary"),
-                        };
-
-                        let payload = frame.into_payload();
-                        let payload = match decompressor.filter(|_| is_compressed) {
-                            Some(mut frame_decompressor) => frame_decompressor(&payload, fin)?,
-                            None => payload,
-                        };
-                        let mut incomplete = match is_compressed {
-                            #[cfg(feature = "deflate")]
-                            true => IncompleteMessage::new_compressed(message_type),
-                            _ => IncompleteMessage::new(message_type),
-                        };
+                let payload = match (data, self.incomplete.as_mut()) {
+                    (OpData::Continue, None) => Err(ProtocolError::UnexpectedContinueFrame),
+                    (OpData::Continue, Some(incomplete)) => {
                         incomplete.extend(payload, self.config.max_message_size)?;
-
-                        self.incomplete = Some(incomplete);
                         Ok(None)
                     }
-                    OpData::Reserved(i) => {
-                        Err(Error::Protocol(ProtocolError::UnknownDataFrameType(i)))
+                    (_, Some(_)) => Err(ProtocolError::ExpectedFragment(data)),
+                    (OpData::Text, _) => Ok(Some((payload, IncompleteMessageType::Text))),
+                    (OpData::Binary, _) => Ok(Some((payload, IncompleteMessageType::Binary))),
+                    (OpData::Reserved(i), _) => Err(ProtocolError::UnknownDataFrameType(i)),
+                }?;
+                match (payload, fin) {
+                    (None, true) => Ok(Some(self.incomplete.take().unwrap().complete()?)),
+                    (None, false) => Ok(None),
+                    (Some((payload, t)), true) => {
+                        check_max_size(payload.len(), self.config.max_message_size)?;
+                        match t {
+                            IncompleteMessageType::Text => {
+                                Ok(Some(Message::Text(payload.try_into()?)))
+                            }
+                            IncompleteMessageType::Binary => Ok(Some(Message::Binary(payload))),
+                        }
+                    }
+                    (Some((payload, t)), false) => {
+                        let mut incomplete = match is_compressed {
+                            #[cfg(feature = "deflate")]
+                            true => IncompleteMessage::new_compressed(t),
+                            _ => IncompleteMessage::new(t),
+                        };
+                        incomplete.extend(payload, self.config.max_message_size)?;
+                        self.incomplete = Some(incomplete);
+                        Ok(None)
                     }
                 }
             }
